@@ -6,9 +6,10 @@ from datetime import datetime, timedelta
 from collections import Counter
 import torch.autograd as autograd
 from torch.optim import Adam
-from data import Dataset, Tree, Field, RawField, ChartField
+from data import Dataset, Tree, Field, RawField, ChartField, TreeSentence
 import argparse
 from torch.nn.utils.rnn import pad_packed_sequence, pack_padded_sequence
+from node import draw_tree
 
 class Metric(object):
   
@@ -230,6 +231,7 @@ class CRFConstituency(nn.Module):
 
     def inside(self, scores, mask):
         batch_size, seq_len, seq_len, n_labels = scores.shape
+        lens = mask[:,0].sum(-1)
         # [seq_len, seq_len, n_labels, batch_size]
         scores = scores.permute(1, 2, 3, 0)
         # [seq_len, seq_len, batch_size]
@@ -237,7 +239,18 @@ class CRFConstituency(nn.Module):
 
         # working in the log space, initial s with log(0) == -inf
         s = torch.full_like(scores[:, :, 0], float('-inf'))
-
+        
+        #get the scores logsumexp
+        
+        #print("Batch size", batch_size)
+        #print("Scores", scores.shape)
+        
+        #get the log sum exp of each of the scores so we can do diagonal
+        #[seq_len, seq_len, batch_size]
+        new_scores = torch.logsumexp(scores, 2)
+        #print("New scores", new_scores.shape)
+        #assert False
+        
         for d in range(2, seq_len + 1): # d = 2, 3, ..., seq_len
             # define the offset variable for convenience
             offset = d - 1
@@ -248,12 +261,35 @@ class CRFConstituency(nn.Module):
             # [batch_size, n]
             diag_mask = mask.diagonal(offset)
 
-            ##### TODO   
-            # if d == 2:
-            #    DO something 
-            # else:
-            #    DO something
-
+            #### TODO   
+            if d == 2: #since the scores are "0" for the uniary case we can just use the logsumexp of the phi scores
+                #this gets the layer up on the pyramid and copies the corresponding pyramid scores [i,j, batch]
+                #[batch_size, n]
+                s.diagonal(offset).copy_(new_scores.diagonal(offset))
+                continue
+            else:
+                #get the corresponding bottom layer scores
+                
+                '''
+                the n represents the total number of scores I need for the next upper layer so n represents the number in the diagonal
+                the offset-1 represents how many of the combinations there are from the bottom rows to the next upper layer
+                the first one is offset with (0,1) because we dont want to start on the diagonal of the s matrix as this is ignored
+                the second one is offset with (1, offset) because we dont want to start at the very top score
+                the second one also goes vertical as we want to the the corresponding right side
+                we can add these values together since the lowest point of the lhs will be added to the highest point of the rhs
+                thus we can do the S[i,k] + S[k+1, j] without the overlapping
+                
+                this whole entire part right here is doing the i, j, k for loop
+                '''
+                # [n, offset, batch_size]
+                prev_s = stripe(s, n, offset-1, (0, 1)) + stripe(s, n, offset-1, (1, offset), 0)
+                #[n, batch_size]
+                lse_prev_s = torch.logsumexp(prev_s, 1)
+                #[batch_size, n]
+                lse_prev_s = lse_prev_s.permute(1,0)
+                #[batch_size, n]
+                s.diagonal(offset).copy_(lse_prev_s + new_scores.diagonal(offset))
+                
         return s
 
 
@@ -528,6 +564,7 @@ def evaluate(model, loader):
         # the tree should be first built and then factorized
         preds = [Tree.build(tree, [(i, j, CHART.vocab[label]) for i, j, label in chart])
                     for tree, chart in zip(trees, chart_preds)]
+        #print(preds[0])
         total_loss += loss.item()
         metric([Tree.factorize(tree, args.delete, args.equal) for tree in preds],
                 [Tree.factorize(tree, args.delete, args.equal) for tree in trees])
